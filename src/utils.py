@@ -5,7 +5,7 @@ Utility functions for FMEA Generator
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 import yaml
 import json
 from datetime import datetime
@@ -235,6 +235,140 @@ def merge_fmea_files(file_paths: list) -> 'pd.DataFrame':
     merged_df = pd.concat(dfs, ignore_index=True)
     
     return merged_df
+
+
+def fuzzy_deduplicate_modes(extracted_data, threshold: float = 0.85):
+    """
+    Apply semantic deduplication of failure modes using fuzzy matching.
+    
+    Merges similar failure modes by clustering based on string similarity.
+    When merging:
+    - occurrence (count) → summed across cluster members
+    - severity → maximum value in cluster
+    - detection → maximum value in cluster
+    - failure_mode → most descriptive (longest string)
+    
+    Args:
+        extracted_data: List of dicts or DataFrame with extracted failure information.
+                       Expected columns: 'failure_mode', 'effect', 'cause', 'severity', 
+                       'occurrence', 'detection', etc.
+        threshold: Similarity threshold (0-1) above which failure modes are considered 
+                  duplicates. Default: 0.85
+    
+    Returns:
+        DataFrame with deduplicated failure modes, ready for RPN calculation.
+    """
+    import pandas as pd
+    from difflib import SequenceMatcher
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Applying fuzzy deduplication with threshold={threshold}")
+    
+    # Convert list of dicts to DataFrame if needed
+    if isinstance(extracted_data, list):
+        if not extracted_data:
+            logger.warning("Empty extracted data provided to fuzzy deduplication")
+            return pd.DataFrame()
+        df = pd.DataFrame(extracted_data)
+    else:
+        df = extracted_data.copy()
+    
+    if df.empty or 'failure_mode' not in df.columns:
+        logger.warning("No failure_mode column found; skipping deduplication")
+        return df
+    
+    # Helper function: compute similarity between two strings
+    def similarity_score(a: str, b: str) -> float:
+        """Compute similarity between two failure mode strings."""
+        if not a or not b:
+            return 0.0
+        
+        a_clean = str(a).lower().strip()
+        b_clean = str(b).lower().strip()
+        
+        # Use SequenceMatcher ratio as primary similarity metric
+        seq_ratio = SequenceMatcher(None, a_clean, b_clean).ratio()
+        return seq_ratio
+    
+    # Cluster similar failure modes
+    df_reset = df.reset_index(drop=True)
+    failure_modes = df_reset['failure_mode'].astype(str).tolist()
+    
+    clusters: List[List[int]] = []
+    processed = set()
+    
+    for i, mode_i in enumerate(failure_modes):
+        if i in processed:
+            continue
+        
+        cluster = [i]
+        processed.add(i)
+        
+        # Find all modes similar to mode_i
+        for j, mode_j in enumerate(failure_modes):
+            if j <= i or j in processed:
+                continue
+            
+            sim = similarity_score(mode_i, mode_j)
+            if sim >= threshold:
+                cluster.append(j)
+                processed.add(j)
+        
+        clusters.append(cluster)
+    
+    # Merge clusters
+    merged_rows = []
+    
+    for cluster_indices in clusters:
+        cluster_df = df_reset.iloc[cluster_indices]
+        
+        # Choose most descriptive failure_mode (longest string)
+        modes = cluster_df['failure_mode'].astype(str)
+        most_descriptive = modes.loc[modes.str.len().idxmax()]
+        
+        merged_row = {
+            'failure_mode': most_descriptive,
+        }
+        
+        # Merge other fields
+        for col in cluster_df.columns:
+            if col == 'failure_mode':
+                continue
+            
+            if col == 'occurrence':
+                # Sum occurrences if numeric
+                occ_vals = pd.to_numeric(cluster_df[col], errors='coerce').dropna()
+                if not occ_vals.empty:
+                    merged_row[col] = int(occ_vals.sum())
+                else:
+                    merged_row[col] = cluster_df[col].iloc[0]
+            
+            elif col in ['severity', 'detection']:
+                # Take maximum if numeric
+                val_series = pd.to_numeric(cluster_df[col], errors='coerce')
+                if not val_series.dropna().empty:
+                    merged_row[col] = int(val_series.max())
+                else:
+                    merged_row[col] = cluster_df[col].iloc[0]
+            
+            else:
+                # For other fields, take first non-null value
+                non_null = cluster_df[col].dropna()
+                if not non_null.empty:
+                    merged_row[col] = non_null.iloc[0]
+                else:
+                    merged_row[col] = None
+        
+        merged_rows.append(merged_row)
+    
+    result_df = pd.DataFrame(merged_rows)
+    
+    removed_count = len(df) - len(result_df)
+    if removed_count > 0:
+        logger.info(f"Fuzzy deduplication removed {removed_count} duplicate entries. "
+                   f"Merged into {len(result_df)} unique failure modes.")
+    
+    return result_df
 
 
 class ProgressTracker:

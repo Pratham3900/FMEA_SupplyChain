@@ -13,6 +13,7 @@ from datetime import datetime
 from preprocessing import DataPreprocessor
 from llm_extractor import LLMExtractor
 from risk_scoring import RiskScoringEngine
+from utils import fuzzy_deduplicate_modes
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,27 @@ logger = logging.getLogger(__name__)
 class FMEAGenerator:
     """
     Complete FMEA generation system
-    Orchestrates preprocessing, extraction, and risk scoring
+    Orchestrates preprocessing, extraction, deduplication, and risk scoring
+    
+    Pipeline Flow:
+    ============
+    For unstructured text:
+      1. Preprocess: Clean and normalize raw text input
+      2. Extract: Use LLM to identify failure modes, effects, causes
+      3. Deduplicate: Apply fuzzy matching to merge similar failure modes
+         (prevents inflated RPN scores from redundant entries)
+      4. Score: Calculate RPN (Severity × Occurrence × Detection)
+      5. Recommend: Generate mitigation actions based on risk scores
+      6. Format: Standardize output with proper column names and sorting
+    
+    For structured data:
+      Similar flow but skips preprocessing, applies deduplication before scoring
+    
+    Deduplication is critical:
+      - Removes exact and semantic duplicates identified via fuzzy string matching
+      - Groups similar failures (e.g., "brake failure" vs "brake system failure")
+      - Aggregates occurrence counts and takes maximum severity/detection
+      - Ensures RPN calculation reflects unique failure modes, not noise
     """
     
     def __init__(self, config: Dict):
@@ -72,13 +93,21 @@ class FMEAGenerator:
         extracted_df['original_text'] = preprocessed_df['text'].values
         extracted_df['sentiment'] = preprocessed_df['sentiment'].values
         
-        # Step 3: Calculate risk scores
+        # Step 3: Apply semantic deduplication of failure modes
+        # This preprocessing step removes duplicate/similar failure modes BEFORE RPN calculation
+        # to prevent inflated risk scores from redundant entries
+        threshold = self.config["text_processing"]["fuzzy_match_threshold"]
+        extracted_df = fuzzy_deduplicate_modes(extracted_df, threshold)
+        logger.info(f"Deduplication completed: {len(extracted_df)} unique failure modes "
+                   f"prepared for risk scoring")
+        
+        # Step 4: Calculate risk scores
         fmea_df = self.scorer.batch_score(extracted_df)
         
-        # Step 4: Generate recommended actions
+        # Step 5: Generate recommended actions
         fmea_df = self._generate_recommendations(fmea_df)
         
-        # Step 5: Format final output
+        # Step 6: Format final output
         fmea_df = self._format_output(fmea_df)
         
         logger.info(f"Generated FMEA with {len(fmea_df)} entries")
@@ -100,7 +129,14 @@ class FMEAGenerator:
         # Step 1: Load and validate structured data
         structured_df = self.preprocessor.load_structured_data(file_path)
         
-        # Step 2: Check if risk scores already exist
+        # Step 2: Apply semantic deduplication of failure modes
+        # This preprocessing step removes duplicate/similar failure modes BEFORE RPN calculation
+        threshold = self.config["text_processing"]["fuzzy_match_threshold"]
+        structured_df = fuzzy_deduplicate_modes(structured_df, threshold)
+        logger.info(f"Deduplication completed: {len(structured_df)} unique failure modes "
+                   f"prepared for risk scoring")
+        
+        # Step 3: Check if risk scores already exist
         has_scores = all(col in structured_df.columns 
                         for col in ['severity', 'occurrence', 'detection'])
         
@@ -123,10 +159,10 @@ class FMEAGenerator:
                 ), axis=1
             )
         
-        # Step 3: Generate recommended actions
+        # Step 4: Generate recommended actions
         fmea_df = self._generate_recommendations(fmea_df)
         
-        # Step 4: Format output
+        # Step 5: Format output
         fmea_df = self._format_output(fmea_df)
         
         logger.info(f"Generated FMEA with {len(fmea_df)} entries")
@@ -138,12 +174,15 @@ class FMEAGenerator:
         """
         Generate FMEA from both structured and unstructured inputs
         
+        Combines results from multiple sources and deduplicates across sources
+        to prevent counting the same failure twice.
+        
         Args:
             structured_file: Path to structured data file
             text_input: Unstructured text data
             
         Returns:
-            Combined FMEA DataFrame
+            Combined FMEA DataFrame with cross-source duplicates removed
         """
         logger.info("Generating hybrid FMEA from multiple sources...")
         
