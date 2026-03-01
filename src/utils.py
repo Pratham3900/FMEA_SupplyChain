@@ -9,6 +9,7 @@ from typing import Dict, Any, List
 import yaml
 import json
 from datetime import datetime
+import pandas as pd
 
 
 def setup_logging(log_level: str = 'INFO', log_file: str = None):
@@ -339,7 +340,9 @@ def fuzzy_deduplicate_modes(extracted_data, threshold: float = 0.85):
                 # Sum occurrences if numeric
                 occ_vals = pd.to_numeric(cluster_df[col], errors='coerce').dropna()
                 if not occ_vals.empty:
-                    merged_row[col] = int(occ_vals.sum())
+                    summed_occ = int(occ_vals.sum())
+                    # Clamp occurrence to FMEA standard range (1–10) after merging
+                    merged_row[col] = max(1, min(summed_occ, 10))
                 else:
                     merged_row[col] = cluster_df[col].iloc[0]
             
